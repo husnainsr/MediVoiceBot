@@ -29,17 +29,29 @@ A Streamlit-based medical assistant application that uses AI to gather patient i
 ## Installation
 
 1. Clone the repository
-2. Install dependencies:
+2. Install Python 3.10:
+
+```bash
+conda create -n medical-assistant python=3.10
+```
+
+3. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
+4. Install espeak-ng.1
+```bash
+https://github.com/espeak-ng/espeak-ng/releases/download/1.52.0/espeak-ng.msi
+```
 
-3. Create a `.env` file with your API keys:
+5. Create a `.env` file with your API keys:
 
 ```bash
 GROQ_API_KEY="your_groq_api_key"
 ```
+
+
 ## Usage
 
 1. Start the application:
