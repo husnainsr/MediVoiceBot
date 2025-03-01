@@ -4,6 +4,9 @@ os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
 import datetime
 from openai import OpenAI
 import streamlit as st
+# First Streamlit command must be set_page_config
+st.set_page_config(page_title="Medical Assistant", page_icon="🏥", layout="wide")
+
 from dataclasses import asdict
 from models import Message
 import logging
@@ -15,6 +18,8 @@ import soundfile as sf
 import io
 import base64
 import warnings
+import asyncio
+import numpy as np
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -22,17 +27,64 @@ warnings.filterwarnings('ignore')
 # Load environment variables
 dotenv.load_dotenv('.env')
 
-# Initialize Kokoro pipeline with error handling
-try:
-    kokoro_pipeline = KPipeline(lang_code='a')
-except Exception as e:
-    st.error(f"Failed to initialize Kokoro: {str(e)}")
-    kokoro_pipeline = None
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client
+# Initialize Kokoro pipeline with error handling and model loading
+try:
+    import torch
+    torch.set_grad_enabled(False)
+    if not torch.cuda.is_available():
+        logger.warning("CUDA not available, using CPU")
+    
+    # Set event loop policy for Windows
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    logger.debug("Initializing Kokoro pipeline...")
+    st.info("Loading TTS models... This may take a moment.")
+    
+    kokoro_pipeline = KPipeline(
+        lang_code='a',
+        repo_id='hexgrad/Kokoro-82M'
+    )
+    
+    # Warm up the model with a test inference
+    logger.debug("Warming up TTS model...")
+    _ = kokoro_pipeline("Test.", voice='af_heart')
+    
+    logger.debug("Kokoro pipeline initialized successfully")
+    st.success("TTS models loaded successfully!")
+except Exception as e:
+    logger.error(f"Failed to initialize Kokoro: {str(e)}", exc_info=True)
+    kokoro_pipeline = None
+    st.error("Failed to initialize TTS system. Some features may not be available.")
+
+# Add this before initializing the OpenAI client
+if 'GROQ_API_KEY' not in st.session_state:
+    st.session_state.GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+# Sidebar for API key input
+with st.sidebar:
+    st.header("API Configuration")
+    api_key = st.text_input(
+        "Enter your Groq API Key",
+        value=st.session_state.GROQ_API_KEY,
+        type="password",
+        help="Get your API key from https://console.groq.com"
+    )
+    if api_key != st.session_state.GROQ_API_KEY:
+        st.session_state.GROQ_API_KEY = api_key
+        st.success("API Key updated!")
+
+# Initialize OpenAI client with the session state API key
 oai_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROK_API_KEY")
+    api_key=st.session_state.GROQ_API_KEY
 )
 
 # Constants
@@ -95,8 +147,19 @@ Remember: You are not a replacement for professional medical care. Your role is 
 
 Begin by asking for the patient's name and their primary concern today."""
 
+# Add this check before making API calls
+def check_api_key():
+    if not st.session_state.GROQ_API_KEY:
+        st.error("Please enter your Groq API key in the sidebar to continue.")
+        return False
+    return True
+
+# Modify the ask_gpt_chat function to include the API key check
 def ask_gpt_chat(prompt: str, messages: list[Message]):
     """Returns ChatGPT's response to the given prompt."""
+    if not check_api_key():
+        return "Please enter your Groq API key to continue."
+        
     system_message = [{"role": "system", "content": prompt}]
     message_dicts = [asdict(message) for message in messages]
     conversation_messages = system_message + message_dicts
@@ -135,11 +198,14 @@ def record_audio():
 def kokoro_text_to_speech(text: str):
     """Converts text to speech using Kokoro TTS."""
     if kokoro_pipeline is None:
+        logger.error("Kokoro pipeline is None - initialization failed")
         st.error("Kokoro TTS is not initialized")
         return
         
     try:
-        # Generate audio using global pipeline
+        logger.debug(f"Starting TTS for text: {text[:50]}...")
+        logger.debug(f"Pipeline type: {type(kokoro_pipeline)}")
+        
         generator = kokoro_pipeline(
             text,
             voice='af_heart',
@@ -147,31 +213,50 @@ def kokoro_text_to_speech(text: str):
             split_pattern=r'\n+'
         )
         
-        # Process all segments and combine audio
-        for i, (gs, ps, audio) in enumerate(generator):
+        logger.debug("Generator created successfully")
+        
+        # Collect all audio segments
+        all_audio = []
+        for gs, ps, audio in generator:
+            all_audio.append(audio)
+        
+        # Concatenate all audio segments
+        if all_audio:
+            combined_audio = np.concatenate(all_audio)
+            
+            # Convert to audio file
             buffer = io.BytesIO()
-            sf.write(buffer, audio, 24000, format='WAV')
+            sf.write(buffer, combined_audio, 24000, format='WAV')
             buffer.seek(0)
             audio_bytes = buffer.read()
             
-            # Convert audio bytes to base64
+            logger.debug(f"Combined audio bytes length: {len(audio_bytes)}")
             b64 = base64.b64encode(audio_bytes).decode()
             
-            # Create HTML with autoplay
+            # Single audio element for the entire response with hidden controls
             audio_html = f"""
-                <audio autoplay>
-                    <source src="data:audio/wav;base64,{b64}" type="audio/wav">
-                </audio>
+                <div id="audio-container" style="display: none;">
+                    <audio id="audio-player" autoplay>
+                        <source src="data:audio/wav;base64,{b64}" type="audio/wav">
+                    </audio>
+                </div>
+                <script>
+                    document.addEventListener('DOMContentLoaded', function() {{
+                        const audioElement = document.getElementById('audio-player');
+                        console.log('Audio element:', audioElement);
+                        audioElement.play().catch(e => console.error('Playback failed:', e));
+                    }});
+                </script>
             """
             
-            # Display using components.html
+            logger.debug("Displaying combined audio component")
             st.components.v1.html(audio_html, height=0)
             
     except Exception as e:
-        st.error(f"Error playing audio: {str(e)}")
+        logger.error(f"TTS error: {str(e)}", exc_info=True)
+        st.error(f"Error in TTS: {str(e)}")
 
 def main():
-    st.set_page_config(page_title="Medical Assistant", page_icon="🏥", layout="wide")
     st.title("AI Medical Assistant")
 
     # Initialize session state
@@ -239,6 +324,7 @@ def main():
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         response = ask_gpt_chat(st.session_state.prompt, st.session_state.messages)
+                        kokoro_text_to_speech(response)
                         st.write(response)
                 
                 # Add assistant message to chat history
