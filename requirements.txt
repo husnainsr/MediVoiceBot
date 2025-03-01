@@ -6,3 +6,4 @@ elevenlabs
 kokoro
 soundfile
 python-dotenv
+pandas

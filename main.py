@@ -1,25 +1,45 @@
 import os
 os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
 
-import datetime
+from datetime import datetime
 from openai import OpenAI
 import streamlit as st
 # First Streamlit command must be set_page_config
-st.set_page_config(page_title="Medical Assistant", page_icon="🏥", layout="wide")
+st.set_page_config(page_title="Medical Assistant", page_icon="��", layout="wide")
+
+# Add this near the top of the file, after st.set_page_config()
+st.markdown("""
+    <style>
+    .stChatFloatingInputContainer {
+        position: fixed;
+        bottom: 0;
+        background: white;
+        padding: 1rem;
+        z-index: 100;
+    }
+    .stChatContainer {
+        height: calc(100vh - 200px);
+        overflow-y: auto;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 from dataclasses import asdict
-from models import Message
+from models import Message, PatientForm
 import logging
 from pathlib import Path
 import dotenv
 import speech_recognition as sr
 from kokoro import KPipeline
+import time
 import soundfile as sf
 import io
 import base64
 import warnings
 import asyncio
 import numpy as np
+import pandas as pd
+import time
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -46,19 +66,27 @@ try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
     logger.debug("Initializing Kokoro pipeline...")
-    st.info("Loading TTS models... This may take a moment.")
     
-    kokoro_pipeline = KPipeline(
-        lang_code='a',
-        repo_id='hexgrad/Kokoro-82M'
-    )
-    
-    # Warm up the model with a test inference
-    logger.debug("Warming up TTS model...")
-    _ = kokoro_pipeline("Test.", voice='af_heart')
-    
-    logger.debug("Kokoro pipeline initialized successfully")
-    st.success("TTS models loaded successfully!")
+    # Create a container for loading messages
+    loading_container = st.empty()
+    with loading_container:
+        loading_container.info("Loading TTS models... This may take a moment.")
+        
+        kokoro_pipeline = KPipeline(
+            lang_code='a',
+            repo_id='hexgrad/Kokoro-82M'
+        )
+        
+        # Warm up the model with a test inference
+        logger.debug("Warming up TTS model...")
+        _ = kokoro_pipeline("Test.", voice='af_heart')
+        
+        logger.debug("Kokoro pipeline initialized successfully")
+        loading_container.success("TTS models loaded successfully!")
+        # Clear the messages after a short delay
+        time.sleep(1)
+        loading_container.empty()
+
 except Exception as e:
     logger.error(f"Failed to initialize Kokoro: {str(e)}", exc_info=True)
     kokoro_pipeline = None
@@ -75,7 +103,8 @@ with st.sidebar:
         "Enter your Groq API Key",
         value=st.session_state.GROQ_API_KEY,
         type="password",
-        help="Get your API key from https://console.groq.com"
+        help="Get your API key from https://console.groq.com",
+        key="global_api_key"
     )
     if api_key != st.session_state.GROQ_API_KEY:
         st.session_state.GROQ_API_KEY = api_key
@@ -101,51 +130,94 @@ AVAILABLE_MODELS = {
     "mistral-saba-24b": "Mistral Saba 24B"
 }
 
+# Hospital database - in a real app this would be in a database
+HOSPITALS = {
+    "New York": [
+        {"name": "NYC General Hospital", "address": "123 Main St, New York, NY", "phone": "212-555-1000"},
+        {"name": "Manhattan Medical Center", "address": "456 Park Ave, New York, NY", "phone": "212-555-2000"}
+    ],
+    "Boston": [
+        {"name": "Boston Medical Center", "address": "789 Washington St, Boston, MA", "phone": "617-555-3000"},
+        {"name": "Massachusetts General Hospital", "address": "55 Fruit St, Boston, MA", "phone": "617-555-4000"}
+    ],
+    "Chicago": [
+        {"name": "Chicago Memorial Hospital", "address": "100 Lake Shore Dr, Chicago, IL", "phone": "312-555-5000"},
+        {"name": "Northwestern Medical Center", "address": "200 Michigan Ave, Chicago, IL", "phone": "312-555-6000"}
+    ],
+    "Los Angeles": [
+        {"name": "LA County Hospital", "address": "1200 N State St, Los Angeles, CA", "phone": "323-555-7000"},
+        {"name": "Cedars-Sinai Medical Center", "address": "8700 Beverly Blvd, Los Angeles, CA", "phone": "310-555-8000"}
+    ],
+    "Other": [
+        {"name": "Regional Medical Center", "address": "Please call for directions", "phone": "800-555-9000"}
+    ]
+}
+
+def find_nearest_hospital(location):
+    """Find hospitals near the patient's location."""
+    location = location.strip().title()
+    
+    # Check if we have hospitals in this location
+    for city in HOSPITALS.keys():
+        if city.lower() in location.lower():
+            return city, HOSPITALS[city]
+    
+    # If no match, return the default "Other" hospitals
+    return "Other", HOSPITALS["Other"]
+
+def refer_to_hospital(patient_form):
+    """Refer the patient to a hospital based on their location and symptoms."""
+    if not patient_form.location:
+        return False
+    
+    city, hospitals = find_nearest_hospital(patient_form.location)
+    
+    # For simplicity, choose the first hospital in the list
+    # In a real app, you would use more sophisticated matching
+    hospital = hospitals[0]
+    
+    # Update the patient form with referral info
+    patient_form.referred_hospital = hospital["name"]
+    # Simulate acceptance (in a real app, the hospital would respond)
+    patient_form.referral_status = "accepted"
+    
+    return hospital
+
 # Default prompt
-DEFAULT_PROMPT = """You are an AI medical assistant designed to help gather patient information and assess their symptoms. Your role is to:
+DEFAULT_PROMPT = """You are an AI medical assistant designed to help gather patient information and direct them to appropriate medical facilities. Your role is to:
 
-1. Collect essential patient information:
-   * Full name
-   * Age
-   * Contact number
-   * Email address
-   * Current address
-   * Medical history
-   * Current medications (if any)
-   * Known allergies
-   * Family medical history (if relevant)
+1. Ask only ONE question at a time
+2. Keep responses brief and focused
+3. Remember previous information shared
+4. After each patient response, update the form with any new information in this format:
+   [FORM_UPDATE]field:value[/FORM_UPDATE]
+   
+   Example:
+   [FORM_UPDATE]name:John Doe,age:45,primary_concern:headache[/FORM_UPDATE]
 
-2. Gather detailed information about their symptoms:
-   * What symptoms are they experiencing?
-   * When did the symptoms start?
-   * Severity of symptoms (scale 1-10)
-   * Any triggers or patterns noticed
-   * Any previous similar experiences
+Follow this sequence of information gathering:
+   - Name
+   - Primary concern
+   - Age
+   - Location (city/state) - THIS IS CRITICAL for hospital matching
+   - Specific symptoms
+   - Duration of symptoms
+   - Severity (1-10)
+   - Previous occurrences
+   - Current medications
+   - Allergies
 
-3. Assess the urgency level:
-   * Emergency (Requires immediate medical attention)
-   * Urgent (Should see a doctor within 24 hours)
-   * Non-urgent (Routine medical care)
-
-Emergency symptoms to watch for:
-* Chest pain or difficulty breathing
-* Severe abdominal pain
-* Sudden confusion or difficulty speaking
-* Severe headache with neck stiffness
-* Loss of consciousness
-* Severe bleeding
-* Suicidal thoughts
-
-Guidelines for interaction:
-* Always maintain a calm and professional tone
+Guidelines:
+* Ask only ONE question at a time
+* Keep responses under 3 sentences
 * If you detect emergency symptoms, immediately advise seeking emergency care
-* Don't make definitive diagnoses - only suggest possible conditions
-* If unsure, always err on the side of caution and recommend professional medical evaluation
-* Respect medical privacy and confidentiality
+* Don't make diagnoses - only suggest possible conditions
+* Use previous chat context to avoid asking repeated questions
+* ALWAYS ask for the patient's location (city/state) as this is essential for hospital matching
 
-Remember: You are not a replacement for professional medical care. Your role is to gather information, assess urgency, and guide users to appropriate medical care.
+Remember: You are not a replacement for professional medical care.
 
-Begin by asking for the patient's name and their primary concern today."""
+Begin by asking ONLY for the patient's name and their primary concern today."""
 
 # Add this check before making API calls
 def check_api_key():
@@ -160,15 +232,45 @@ def ask_gpt_chat(prompt: str, messages: list[Message]):
     if not check_api_key():
         return "Please enter your Groq API key to continue."
         
-    system_message = [{"role": "system", "content": prompt}]
-    message_dicts = [asdict(message) for message in messages]
-    conversation_messages = system_message + message_dicts
+    # Move the form update instruction to the main system prompt instead of a separate message
+    system_prompt = prompt + "\n\nAfter each patient response, update the form with any new information provided. Format: [FORM_UPDATE]field:value[/FORM_UPDATE]. IMPORTANT: Do not include any text about form updates in your visible response to the patient."
+    
     response = oai_client.chat.completions.create(
         model=st.session_state.selected_model,
-        messages=conversation_messages,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            *[asdict(message) for message in messages]
+        ],
         temperature=MODEL_TEMPERATURE
     )
-    return response.choices[0].message.content
+    
+    content = response.choices[0].message.content
+    
+    # Extract form updates if present
+    if "[FORM_UPDATE]" in content:
+        try:
+            form_updates = content.split("[FORM_UPDATE]")[1].split("[/FORM_UPDATE]")[0].split(",")
+            for update in form_updates:
+                if ":" in update:
+                    field, value = update.strip().split(":", 1)
+                    if hasattr(st.session_state.patient_form, field.lower()):
+                        setattr(st.session_state.patient_form, field.lower(), value.strip())
+            
+            # Return only the response without the form updates and any instructions
+            clean_response = content.split("[FORM_UPDATE]")[0].strip()
+            # Remove any remaining instructions about updating forms
+            clean_response = clean_response.replace("After the patient responds, please update the form", "")
+            clean_response = clean_response.replace("with their name.", "")
+            clean_response = clean_response.replace("with their primary concern.", "")
+            clean_response = clean_response.replace("with their age.", "")
+            clean_response = clean_response.replace("with their location.", "")
+            return clean_response.strip()
+        except Exception as e:
+            logger.error(f"Error processing form updates: {str(e)}")
+            # If there's an error processing the form updates, just return the content without them
+            return content.split("[FORM_UPDATE]")[0].strip()
+    
+    return content
 
 def record_audio():
     """Record audio from microphone and return the transcript."""
@@ -192,6 +294,7 @@ def record_audio():
             st.warning("Could not understand audio. Please try again.")
             return None
         except sr.RequestError as e:
+            
             st.error(f"Could not request results; {e}")
             return None
 
@@ -268,10 +371,15 @@ def main():
         st.session_state.listening = False
     if 'selected_model' not in st.session_state:
         st.session_state.selected_model = CHAT_MODEL
+    if 'patient_form' not in st.session_state:
+        st.session_state.patient_form = PatientForm(timestamp=datetime.now())
+    if 'show_hospital_info' not in st.session_state:
+        st.session_state.show_hospital_info = False
+    if 'assessment_complete' not in st.session_state:
+        st.session_state.assessment_complete = False
 
-    # Sidebar for prompt editing
+    # Sidebar for essential controls only
     with st.sidebar:
-        st.header("Settings")
         selected_model = st.selectbox(
             "Select Model",
             options=list(AVAILABLE_MODELS.keys()),
@@ -280,33 +388,100 @@ def main():
         )
         if selected_model != st.session_state.selected_model:
             st.session_state.selected_model = selected_model
-            st.session_state.messages = []
-            st.success("Model changed and chat history cleared!")
-        
-        st.header("System Prompt")
-        new_prompt = st.text_area("Edit prompt here:", st.session_state.prompt, height=400)
-        if st.button("Update Prompt"):
-            st.session_state.prompt = new_prompt
-            st.session_state.messages = []
-            st.success("Prompt updated and chat history cleared!")
-        
-        if st.button("Reset to Default"):
-            st.session_state.prompt = DEFAULT_PROMPT
-            st.session_state.messages = []
-            st.success("Prompt reset to default and chat history cleared!")
-        
+            
         if st.button("Clear Chat"):
             st.session_state.messages = []
+            st.session_state.patient_form = PatientForm(timestamp=datetime.now())
+            st.session_state.assessment_complete = False
+            st.session_state.show_hospital_info = False
             st.rerun()
+            
+        # Show patient form data for debugging/admin purposes
+        with st.expander("Patient Data (Admin View)"):
+            if st.session_state.patient_form.name:
+                for field, value in st.session_state.patient_form.to_dict().items():
+                    st.write(f"**{field}:** {value}")
+                
+                if st.button("Download Patient Form"):
+                    df = pd.DataFrame([st.session_state.patient_form.to_dict()])
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        label="Download as CSV",
+                        data=csv,
+                        file_name=f"patient_{st.session_state.patient_form.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+            else:
+                st.info("No patient information collected yet.")
 
-    # Main chat interface
+    # Main chat interface with columns
     chat_col, control_col = st.columns([2, 1])
 
     with chat_col:
-        # Display chat messages
-        for message in st.session_state.messages:
-            with st.chat_message(message.role):
-                st.write(message.content)
+        # Create a container for messages with fixed height and scrolling
+        chat_container = st.container()
+        
+        # Create a container for the input at the bottom
+        input_container = st.container()
+        
+        # Display messages in scrollable container
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message.role):
+                    st.write(message.content)
+            
+            # Show hospital recommendation when assessment is complete
+            if st.session_state.assessment_complete and st.session_state.patient_form.location:
+                # Find and display hospital recommendation
+                city, hospitals = find_nearest_hospital(st.session_state.patient_form.location)
+                
+                with st.container():
+                    st.markdown("### 🏥 Hospital Recommendation")
+                    st.markdown(f"Based on your symptoms and location in **{city}**, we recommend:")
+                    
+                    for i, hospital in enumerate(hospitals[:2]):  # Show top 2 hospitals
+                        st.markdown(f"""
+                        #### {hospital['name']}
+                        **Address:** {hospital['address']}  
+                        **Phone:** {hospital['phone']}
+                        """)
+                        
+                        # Create a unique key for each button
+                        if st.button(f"Select {hospital['name']}", key=f"select_hospital_{i}"):
+                            st.session_state.patient_form.referred_hospital = hospital['name']
+                            st.session_state.patient_form.referral_status = "accepted"
+                            st.session_state.show_hospital_info = True
+                            st.rerun()
+                    
+                    st.info("Please select a hospital to proceed with your care.")
+        
+        # Handle input
+        with input_container:
+            user_input = st.chat_input("Type your message here...")
+            
+        # Process user input
+        if user_input:
+            # Add user message to chat
+            st.session_state.messages.append(Message(role="user", content=user_input))
+            with st.chat_message("user"):
+                st.write(user_input)
+            
+            # Get AI response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    response = ask_gpt_chat(st.session_state.prompt, st.session_state.messages)
+                    st.write(response)
+                    # Add assistant message to chat history before TTS
+                    st.session_state.messages.append(Message(role="assistant", content=response))
+                    # Generate speech after message is displayed
+                    kokoro_text_to_speech(response)
+            
+            # Check if we have enough information to complete assessment
+            form = st.session_state.patient_form
+            if (form.name and form.primary_concern and form.location and 
+                form.specific_symptoms and form.severity):
+                st.session_state.assessment_complete = True
+                st.rerun()  # Refresh to show hospital recommendations
 
     with control_col:
         st.header("Voice Controls")
@@ -324,18 +499,50 @@ def main():
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         response = ask_gpt_chat(st.session_state.prompt, st.session_state.messages)
-                        kokoro_text_to_speech(response)
                         st.write(response)
+                        # Add assistant message to chat history before TTS
+                        st.session_state.messages.append(Message(role="assistant", content=response))
+                        # Generate speech after message is displayed
+                        kokoro_text_to_speech(response)
                 
-                # Add assistant message to chat history
-                st.session_state.messages.append(Message(role="assistant", content=response))
+                # Check if we have enough information to complete assessment
+                form = st.session_state.patient_form
+                if (form.name and form.primary_concern and form.location and 
+                    form.specific_symptoms and form.severity):
+                    st.session_state.assessment_complete = True
+                    st.rerun()  # Refresh to show hospital recommendations
+
+        # Show selected hospital confirmation
+        if st.session_state.show_hospital_info and st.session_state.patient_form.referred_hospital:
+            st.success("Hospital selected!")
+            city, hospitals = find_nearest_hospital(st.session_state.patient_form.location)
+            for hospital in hospitals:
+                if hospital["name"] == st.session_state.patient_form.referred_hospital:
+                    st.markdown(f"""
+                    ### Your Referral
+                    
+                    You've been referred to:
+                    
+                    **{hospital["name"]}**  
+                    {hospital["address"]}  
+                    📞 {hospital["phone"]}
+                    
+                    Please contact them to schedule your appointment.
+                    """)
+                    
+                    # Add directions link
+                    address_query = hospital["address"].replace(" ", "+")
+                    maps_url = f"https://www.google.com/maps/search/?api=1&query={address_query}"
+                    st.markdown(f"[Get Directions]({maps_url})")
+                    break
 
         st.info("""
         Instructions:
-        1. Click 'Start Speaking' to begin
-        2. Speak clearly into your microphone
-        3. Wait for the AI to process and respond
-        4. The response will be spoken automatically
+        1. Type in the chat box or click 'Start Speaking'
+        2. For voice: Speak clearly into your microphone
+        3. Answer all questions about your symptoms
+        4. You'll receive hospital recommendations based on your location
+        5. Select a hospital to get contact information
         
         Note: This is not a replacement for professional medical care.
         """)
