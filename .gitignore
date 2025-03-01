@@ -1,0 +1,16 @@
+logs/
+outputs/
+recordings/
+transcripts/
+.env
+__pycache__/
+.mypy_cache/
+__pycache__/
+.env.local
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.flac
+*.aac
+*.mp4
